@@ -39,6 +39,9 @@ func (p *Proxy) Serve() error {
 	// spawn.
 	failCh := make(chan error, 1)
 
+	// Track active listeners for minimal updates when the configuration changes.
+	active := map[string]*Listener{}
+
 	// Watch for config changes (initial setup happens on first "change")
 	for {
 		select {
@@ -97,15 +100,22 @@ func (p *Proxy) Serve() error {
 				}()
 			}
 
-			// TODO(banks) update/remove upstreams properly based on a diff with current. Can
-			// store a map of uc.String() to Listener here and then use it to only
-			// start one of each and stop/modify if changes occur.
+			// When the configuration changes, stop and remove listeners that aren't
+			// referenced in the new configuration. This will allow us to register any
+			// new listeners without conflicts if there are any overlaps.
+			p.removeOldListeners(active, newCfg.Upstreams)
+
 			for _, uc := range newCfg.Upstreams {
 				uc.applyDefaults()
 
 				if uc.LocalBindPort < 1 {
 					p.logger.Error("upstream has no local_bind_port. "+
 						"Can't start upstream.", "upstream", uc.String())
+					continue
+				}
+
+				if existing := active[uc.String()]; existing != nil {
+					// Re-using an existing, active listener. Nothing to do.
 					continue
 				}
 
@@ -117,12 +127,43 @@ func (p *Proxy) Serve() error {
 						"error", err,
 					)
 				}
+				active[uc.String()] = l
 			}
 			cfg = newCfg
 
 		case <-p.stopChan:
 			return nil
 		}
+	}
+}
+
+// removeOldListeners removes listeners from `active` that aren't referenced in
+// newUpstreams. The removed listeners are closed and any errors are logged.
+// This should be called BEFORE adding new listeners from a new configuration so
+// that if a particular port is switched from one target service to another
+// service it will correctly be re-tasked.
+func (p *Proxy) removeOldListeners(active map[string]*Listener, newUpstreams []UpstreamConfig) {
+	oldUpstreamsToRemove := map[string]bool{}
+	// Initially assume that we should remove all of the active upstreams.
+	for active := range active {
+		oldUpstreamsToRemove[active] = true
+	}
+	// Remove all the new configurations from the map so that we don't remove one
+	// that hasn't changed.
+	for _, uc := range newUpstreams {
+		delete(oldUpstreamsToRemove, uc.String())
+	}
+	// Actually remove the upstreams that aren't referenced in the new config.
+	for upstream := range oldUpstreamsToRemove {
+		if err := active[upstream].Close(); err != nil {
+			p.logger.Error("failed closing removed upstream",
+				"listener", upstream, "error", "err")
+		}
+		// Remove from active even if Close() fails (which the current
+		// implementation never does). This prevents us from from trying to re-use a
+		// partially-closed connection and we'll surface new Listener errors if the
+		// port is still bound.
+		delete(active, upstream)
 	}
 }
 
