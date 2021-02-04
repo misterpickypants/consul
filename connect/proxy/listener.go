@@ -34,7 +34,10 @@ type Listener struct {
 	bindAddr   string
 
 	stopFlag int32
+	// closed when the listener should be stopped.
 	stopChan chan struct{}
+	// closed when the listener is actually stopped and the local socket released.
+	stoppedChan chan struct{}
 
 	// listeningChan is closed when listener is opened successfully. It's really
 	// only for use in tests where we need to coordinate wait for the Serve
@@ -70,6 +73,7 @@ func NewPublicListener(svc *connect.Service, cfg PublicListenerConfig,
 		},
 		bindAddr:      bindAddr,
 		stopChan:      make(chan struct{}),
+		stoppedChan:   make(chan struct{}),
 		listeningChan: make(chan struct{}),
 		logger:        logger.Named(publicListenerPrefix),
 		metricPrefix:  publicListenerPrefix,
@@ -114,6 +118,7 @@ func newUpstreamListenerWithResolver(svc *connect.Service, cfg UpstreamConfig,
 		},
 		bindAddr:      bindAddr,
 		stopChan:      make(chan struct{}),
+		stoppedChan:   make(chan struct{}),
 		listeningChan: make(chan struct{}),
 		logger:        logger.Named(upstreamListenerPrefix),
 		metricPrefix:  upstreamListenerPrefix,
@@ -141,6 +146,16 @@ func (l *Listener) Serve() error {
 		return err
 	}
 	close(l.listeningChan)
+
+	// Stop the listener when .Close() is called and we're requested to shut down.
+	go func() {
+		<-l.stopChan
+		l.connWG.Wait()
+		if err := listen.Close(); err != nil {
+			l.logger.Error("closing listener", "error", err)
+		}
+		close(l.stoppedChan)
+	}()
 
 	for {
 		conn, err := listen.Accept()
@@ -244,8 +259,8 @@ func (l *Listener) Close() error {
 	oldFlag := atomic.SwapInt32(&l.stopFlag, 1)
 	if oldFlag == 0 {
 		close(l.stopChan)
-		// Wait for all conns to close
-		l.connWG.Wait()
+		// Wait for all conns to close and the listener to be released.
+		<-l.stoppedChan
 	}
 	return nil
 }

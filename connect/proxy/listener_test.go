@@ -223,4 +223,9 @@ func TestUpstreamListener(t *testing.T) {
 	// Check all the tx/rx counters got added
 	assertAllTimeCounterValue(t, sink, "consul.proxy.test.upstream.tx_bytes;src=web;dst_type=service;dst=db", 11)
 	assertAllTimeCounterValue(t, sink, "consul.proxy.test.upstream.rx_bytes;src=web;dst_type=service;dst=db", 11)
+
+	// Ensure that when the listener is closed the port is actually released.
+	_, err = net.Dial("tcp",
+		ipaddr.FormatAddressPort(cfg.LocalBindAddress, cfg.LocalBindPort))
+	require.Error(t, err, "listener port not released")
 }
